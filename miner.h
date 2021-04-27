@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <semaphore.h>
 
 #define OK 0
 #define MAX_WORKERS 10
@@ -21,12 +22,13 @@ typedef struct _Block {
 typedef struct _NetData {
     pid_t miners_pid[MAX_MINERS];
     char voting_pool[MAX_MINERS];
-    int last_miner;
+    /* int last_miner; */
     int total_miners;
     pid_t monitor_pid;
     pid_t last_winner;
+    sem_t sem_net_mutex;
 } NetData;
 
 long int simple_hash(long int number);
-
-void print_blocks(Block * plast_block, int num_wallets);
+int net_register(NetData **netStruct, int *miner_ind);
+int clean(NetData *netStruct, int miner_ind);
