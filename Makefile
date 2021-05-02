@@ -2,9 +2,9 @@ CC = gcc
 LDLIBS = -lrt -lpthread
 
 %.o: %.c
-	$(CC) -c $<
+	# $(CC) -c $<
 	# For debugging
-	# $(CC) -c -g $<
+	$(CC) -g -c $<
 
 all: miner
 
