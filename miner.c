@@ -531,12 +531,6 @@ int prepare_next_round(NetData *netStruct, Block *blockStruct) {
 
     sem_post(&(netStruct->sem_block_mutex));
 
-    /* TODO:
-     * Asegurarse que llegados a este punto, el numero total de
-     * mineros activos esté actualizado con los que se han ido
-     * y con los que han entrado, y que todos los mineros han
-     * actualizado su blockchain. */
-
     for (i=0; i<n_miners; i++) {
         sem_post(&(netStruct->sem_round));
     }
