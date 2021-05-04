@@ -67,7 +67,6 @@ int main(int argc, char **argv) {
     int miner_index; /* To free miners_pid position on shared memory later */
     int win = FALSE;
     int n_workers, n_rounds;
-    pthread_t workers[MAX_WORKERS];
 
     srand(time(NULL));
 
@@ -77,7 +76,7 @@ int main(int argc, char **argv) {
 
     if (net_register(&net_data, &shm_block, &miner_index) != EXIT_SUCCESS) exit(EXIT_FAILURE);
 
-    if (miner_main_loop(net_data, shm_block, &plast_block, miner_index, workers, n_workers, n_rounds, &win) != EXIT_SUCCESS) {
+    if (miner_main_loop(net_data, shm_block, &plast_block, miner_index, n_workers, n_rounds, &win) != EXIT_SUCCESS) {
         clean(net_data, shm_block, plast_block, miner_index, &win);
         exit(EXIT_FAILURE);
     }
@@ -87,6 +86,42 @@ int main(int argc, char **argv) {
     if (clean(net_data, shm_block, plast_block, miner_index, &win) != EXIT_SUCCESS) exit(EXIT_FAILURE);
 
     exit(EXIT_SUCCESS);
+}
+
+
+
+
+/* Private */
+int down(sem_t *sem) {
+    while (sem_wait(sem) != 0) {
+        if (errno != EINTR) {
+            return EXIT_FAILURE;
+        }
+    }
+
+    return EXIT_SUCCESS;
+}
+
+/* Private */
+int down_timed(sem_t *sem) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+        perror("Error: could not get actual time\nclock_gettime");
+        return EXIT_FAILURE;
+    }
+
+    ts.tv_sec += SEM_TIMEOUT;
+
+    if (sem_timedwait(sem, &ts) == -1) {
+        if (errno == ETIMEDOUT) {
+            fprintf(stdout, "Max timeout reached. Aborting...\n");
+            return EXIT_SUCCESS;
+        }
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
 }
 
 
@@ -205,7 +240,9 @@ int init_net(NetData *netStruct, Block **blockStruct, int *miner_ind) {
         || sem_init(&(netStruct->sem_round), 1, 1) == -1
         || sem_init(&(netStruct->sem_winner), 1, 1) == -1
         || sem_init(&(netStruct->sem_updated), 1, 0) == -1
-        || sem_init(&(netStruct->sem_entry), 1, 1) == -1)
+        || sem_init(&(netStruct->sem_entry), 1, 1) == -1
+        || sem_init(&(netStruct->sem_voting), 1, 0) == -1
+        || sem_init(&(netStruct->sem_result), 1, 0) == -1)
     {
         perror("Error: could not initialize a semaphore\nsem_init");
         shm_unlink(SHM_NAME_NET);
@@ -214,6 +251,8 @@ int init_net(NetData *netStruct, Block **blockStruct, int *miner_ind) {
     }
 
     netStruct->miners_pid[0] = getpid();
+    netStruct->last_winner = -1;
+    netStruct->current_winner = -1;
     /* Initialize all array elements to -1, to indicate there is no active miner */
     for (int i=1; i<MAX_MINERS; i++) netStruct->miners_pid[i] = -1;
     netStruct->total_miners = 1;
@@ -263,9 +302,9 @@ int open_shm_block(Block **blockStruct, int miner_ind) {
 int join_net(NetData *netStruct, Block **blockStruct, int *miner_ind) {
     int i;
 
-    sem_wait(&(netStruct->sem_entry));
+    down(&(netStruct->sem_entry));
 
-    sem_wait(&(netStruct->sem_net_mutex));
+    down(&(netStruct->sem_net_mutex));
 
     for (i=0; netStruct->miners_pid[i]!=-1 && i<netStruct->total_miners+1; i++);
     if (i >= MAX_MINERS) {
@@ -280,7 +319,7 @@ int join_net(NetData *netStruct, Block **blockStruct, int *miner_ind) {
 
     sem_post(&(netStruct->sem_net_mutex));
 
-    sem_wait(&(netStruct->sem_block_mutex));
+    down(&(netStruct->sem_block_mutex));
 
     if (open_shm_block(blockStruct, *miner_ind) == EXIT_FAILURE) {
         /* If error, revert changes and exit */
@@ -371,186 +410,300 @@ void *worker_main_loop(struct worker_args_struct *args) {
     pthread_exit(NULL);
 }
 
-int miner_main_loop(NetData *netStruct, Block *blockStruct, Block **pplast_block, int miner_ind, pthread_t *workers, int n_workers, int n_rounds, int *win) {
-    int i, j, k, f, error;
-    long target, solution;
-    double div;
-    struct worker_args_struct *w_args;
-    void *ret;
+/* Private */
+int setup_workers(pthread_t **workers, struct worker_args_struct **w_args, int n_workers) {
 
-    div = (double)PRIME/(double)n_workers;
-
-    w_args = (struct worker_args_struct *) malloc(n_workers*sizeof(struct worker_args_struct));
-    if (w_args == NULL) {
+    *workers = (pthread_t*) malloc(n_workers*sizeof(pthread_t));
+    if (*workers == NULL) {
         perror("Error: could not alloc memory\nmalloc");
         return EXIT_FAILURE;
     }
 
+    *w_args = (struct worker_args_struct *) malloc(n_workers*sizeof(struct worker_args_struct));
+    if (*w_args == NULL) {
+        perror("Error: could not alloc memory\nmalloc");
+        free(*workers);
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
+}
+
+/* Private */
+int load_workers(pthread_t *workers, struct worker_args_struct *w_args, int n_workers, long target, long *solution, int *win) {
+    int i, f, error;
+    double div;
+
+    div = (double)PRIME/(double)n_workers;
+    f = 0;
+
+    /* Initialize workers (threads) */
+    for (i=0; flag && i<n_workers; i++) {
+        w_args[i].start = i*div;
+        w_args[i].end = (i+1)*div;
+        w_args[i].target = target;
+        w_args[i].solution = -1;
+        error = pthread_create(workers+i, NULL, (void*) worker_main_loop, w_args+i);
+        if (error != 0) {
+            fprintf(stderr, "Error: could not start worker\npthread_create: %s\n", strerror(error));
+            flag = FALSE; /* Tell other workers to end */
+            f = TRUE; /* To return error later */
+            break; /* Stop creating new threads, and join the ones created */
+        }
+    }
+
+    /* Wait for workers to end */
+    for (i--; i>=0; i--) {
+        error = pthread_join(workers[i], NULL);
+        /* If thread did not end correctly, tell other threads to end, wait for them and return error */
+        if (error != 0) {
+            fprintf(stderr, "Error: worker did not end correctly\npthread_join: %s\n", strerror(error));
+            flag = FALSE; /* Tell other active threads to end */
+            f = TRUE; /* To return error later */
+        }
+        else if (!f && w_args[i].solution > 0) {
+            /* If worker found the solution, and no error occured, update win status */
+            *solution = w_args[i].solution;
+            *win = TRUE;
+        }
+    }
+
+    if (f) return EXIT_FAILURE;
+    return EXIT_SUCCESS;
+}
+
+/* Private */
+int handle_win(NetData *netStruct, Block *blockStruct, long solution, int *n_miners) {
+    int j, k;
+
+    down(&(netStruct->sem_winner));
+    down(&(netStruct->sem_net_mutex));
+    if (netStruct->current_winner > 0) {
+        /* Another miner has already found the solution, retry */
+        fprintf(stdout, "Another miner found already the same solution\n"); /* REMOVE */
+        sem_post(&(netStruct->sem_net_mutex));
+        sem_post(&(netStruct->sem_winner));
+        return FALSE;
+    }
+    else {
+        fprintf(stdout, "Found solution: %ld\n", solution); /* REMOVE */
+
+        netStruct->current_winner = getpid();
+        /* Stop other miners */
+        for (k=0, k=0; j < netStruct->total_miners && k < MAX_MINERS; k++) {
+            if (netStruct->miners_pid[k] != -1 && netStruct->miners_pid[k] != getpid()) {
+                kill(netStruct->miners_pid[k], SIGUSR2);
+                j++;
+            }
+        }
+        sem_post(&(netStruct->sem_net_mutex));
+
+        /* Now other miners must wait to enter the net */
+        down(&(netStruct->sem_entry));
+
+
+        down(&(netStruct->sem_net_mutex));
+        /* Number of miners that will participate in the voting */
+        *n_miners = netStruct->total_miners;
+        sem_post(&(netStruct->sem_net_mutex));
+
+
+        down(&(netStruct->sem_block_mutex));
+        /* Write solution to shared memory block */
+        blockStruct->solution = solution;
+        sem_post(&(netStruct->sem_block_mutex));
+
+        sem_post(&(netStruct->sem_winner));
+        return TRUE;
+    }
+}
+
+int handle_voting(NetData *netStruct, Block *blockStruct, int miner_ind,  int n_miners) {
+    int i, v_yes, v_no, ret;
+
+    /* Wait until every miner has voted */
+    for (i=0; i<n_miners-1; i++) down(&(netStruct->sem_voting));
+
+    for (i=0, v_yes=0, v_no=0; i<MAX_MINERS; i++) {
+        if (netStruct->voting_pool[i] == TRUE) v_yes++;
+        else if (netStruct->voting_pool[i] == FALSE) v_no++;
+    }
+
+    if (v_yes > v_no || (v_yes==0 && v_no==0)) {
+        down(&(netStruct->sem_block_mutex));
+        blockStruct->is_valid = TRUE;
+        blockStruct->wallets[miner_ind]++;
+        sem_post(&(netStruct->sem_block_mutex));
+        ret = TRUE;
+    }
+    else {
+        fprintf(stdout, "Not enough votes, invalid solution\n");
+        ret = FALSE;
+    }
+
+    for (i=0; i<n_miners-1; i++) sem_post(&(netStruct->sem_result));
+
+    return ret;
+}
+
+int vote(NetData *netStruct, Block *blockStruct, int miner_ind) {
+    long solution, target;
+    int ret;
+
+    /* Wait for winner to update solution */
+    down(&(netStruct->sem_winner));
+
+    down(&(netStruct->sem_block_mutex));
+    solution = blockStruct->solution;
+    target = blockStruct->target;
+    sem_post(&(netStruct->sem_block_mutex));
+
+    if (simple_hash(solution) == target) {
+        down(&(netStruct->sem_net_mutex));
+        netStruct->voting_pool[miner_ind] = TRUE;
+        sem_post(&(netStruct->sem_net_mutex));
+        fprintf(stdout, "Voted in favor. solution: %ld, target: %ld\n", solution, target); /* REMOVE */
+    }
+    else {
+        down(&(netStruct->sem_net_mutex));
+        netStruct->voting_pool[miner_ind] = FALSE;
+        sem_post(&(netStruct->sem_net_mutex));
+        fprintf(stdout, "Voted against. solution: %ld, target: %ld\n", solution, target); /* REMOVE */
+    }
+
+    sem_post(&(netStruct->sem_voting));
+
+    sem_post(&(netStruct->sem_winner));
+
+    /* Wait until voting's result is known */
+    down_timed(&(netStruct->sem_result));
+
+    down(&(netStruct->sem_block_mutex));
+    ret = blockStruct->is_valid;
+    sem_post(&(netStruct->sem_block_mutex));
+
+    return ret;
+}
+
+int miner_main_loop(NetData *netStruct, Block *blockStruct, Block **pplast_block, int miner_ind, int n_workers, int n_rounds, int *win) {
+    int i, j, v_res, n_miners;
+    long target, solution;
+    pthread_t *workers;
+    struct worker_args_struct *w_args;
+
+    if (setup_workers(&workers, &w_args, n_workers) != EXIT_SUCCESS) return EXIT_FAILURE;
+
     /* Main loop */
     i = 0; /* Round counter */
-    f = FALSE; /* Error handling */
     while (active && (n_rounds<=0 || i<n_rounds)) {
         *win = FALSE;
-        sem_wait(&(netStruct->sem_round));
+        down(&(netStruct->sem_round));
 
-        sem_wait(&(netStruct->sem_block_mutex));
+        down(&(netStruct->sem_block_mutex));
         target = blockStruct->target;
         sem_post(&(netStruct->sem_block_mutex));
 
         fprintf(stdout, "Searching solution for block with target: %ld\n", target); /* REMOVE */
 
-        /* Initialize workers (threads) */
-        for (j=0; flag && j<n_workers; j++) {
-            w_args[j].start = j*div;
-            w_args[j].end = (j+1)*div;
-            w_args[j].target = target;
-            w_args[j].solution = -1;
-            error = pthread_create(workers+j, NULL, (void*) worker_main_loop, w_args+j);
-            if (error != 0) {
-                fprintf(stderr, "Error: could not start worker\npthread_create: %s\n", strerror(error));
-                flag = FALSE; /* Tell other workers to end */
-                f = TRUE; /* To return error later */
-                break; /* Stop creating new threads, and join the ones created */
-            }
+        if (load_workers(workers, w_args, n_workers, target, &solution, win) != EXIT_SUCCESS) {
+            free(workers);
+            free(w_args);
+            return EXIT_FAILURE;
         }
 
-        /* Wait for workers to end */
-        for (j--; j>=0; j--) {
-            error = pthread_join(workers[j], NULL);
-            /* If thread did not end correctly, tell other threads to end, wait for them and return error */
-            if (error != 0) {
-                fprintf(stderr, "Error: worker did not end correctly\npthread_join: %s\n", strerror(error));
-                flag = FALSE; /* Tell other active threads to end */
-                f = TRUE; /* To return error later */
-            }
-            else if (!f && w_args[j].solution > 0) {
-                /* If worker found the solution, and no error occured, update win status */
-                solution = w_args[j].solution;
-                *win = TRUE;
-            }
-        }
+        /* If there has been more than one winner, reduce them to just one.
+         * Stop other miners, and write solution to shared memory block. */
+        if (*win == TRUE) *win = handle_win(netStruct, blockStruct, solution, &n_miners);
 
-        /* Return error if a thread could not be created, or could not end correctly */
-        if (f) return EXIT_FAILURE;
+        if (*win == TRUE) v_res = handle_voting(netStruct, blockStruct, miner_ind, n_miners); /* Will wait for all miners to vote */
+        else v_res = vote(netStruct, blockStruct, miner_ind); /* Will end when voting result is known */
 
-        if (*win == TRUE) {
-            if (sem_trywait(&(netStruct->sem_winner)) == 0) {
 
-                fprintf(stdout, "Found solution: %ld for block with target: %ld\n", solution, target); /* REMOVE */
-
-                /* Now other miners must wait to enter the net */
-                sem_wait(&(netStruct->sem_entry));
-
-                /* Stop other miners */
-                sem_wait(&(netStruct->sem_net_mutex));
-                for (k=0, k=0; j < netStruct->total_miners && k < MAX_MINERS; k++) {
-                    if (netStruct->miners_pid[k] != -1 && netStruct->miners_pid[k] != getpid()) {
-                        kill(netStruct->miners_pid[k], SIGUSR2);
-                        j++;
-                    }
-                }
-                sem_post(&(netStruct->sem_net_mutex));
-
-                sem_wait(&(netStruct->sem_block_mutex));
-                /* Write solution to shared memory block */
-                blockStruct->solution = solution;
-
-                /* TODO Handle voting */
-                blockStruct->is_valid = TRUE; /* Do if successful voting */
-                blockStruct->wallets[miner_ind]++; /* Do if successful voting */
-
-                sem_post(&(netStruct->sem_block_mutex));
-                sem_post(&(netStruct->sem_winner));
-            }
-            else {
-                /* Another miner has already won */
-                if (error == EAGAIN) *win = FALSE;
-            }
-        }
-        else {
-            fprintf(stdout, "Mining round finished without success.\n"); /* REMOVE */
-            /* TODO Vote */
-        }
-
-        /* TODO Check if valid before */
-        sem_wait(&(netStruct->sem_block_mutex));
-        if (blockStruct->is_valid) {
-            /* sem_post(&(netStruct->sem_block_mutex)); */
-            sem_wait(&(netStruct->sem_winner));
-            /* sem_wait(&(netStruct->sem_block_mutex)); */
+        if (v_res == TRUE) {
             fprintf(stdout, "Updating blockchain with winner's solution.\n"); /* REMOVE */
-            if (update_blockchain(pplast_block, blockStruct) != EXIT_SUCCESS) {
+            if (update_blockchain(netStruct, blockStruct, pplast_block) != EXIT_SUCCESS) {
                 /* CdE */
+                free(workers);
+                free(w_args);
+                return EXIT_FAILURE;
             }
-            sem_post(&(netStruct->sem_block_mutex));
-            sem_post(&(netStruct->sem_winner));
 
-            /* For the next round */
-            i++;
-            flag = TRUE;
-            if (*win) {
-                /* Winner does not have to do UP on update sem */
-                prepare_next_round(netStruct, blockStruct);
+            if (*win == TRUE) {
+                /* Wait for all miners (except winner) to update their blockchains */
+                for (j=0; j<n_miners-1; j++) down(&(netStruct->sem_updated));
             }
-            else if (active && (n_rounds<=0 || i<n_rounds)) {
-                /* If this is miner's last round, update just after
-                 * cleaning and decreasing total miners, so it will
-                 * not be active when the next round begins. */
+            else if (active && (n_rounds<=0 || (i+1)<n_rounds)) {
+                /* If this is miner's last round, update just after cleaning and decreasing
+                 * total miners, so it will not be active when the next round begins. */
                 sem_post(&(netStruct->sem_updated));
             }
         }
-        else {
-            sem_post(&(netStruct->sem_block_mutex));
-            sem_post(&(netStruct->sem_round));
-        }
+
+        /* For the next round */
+        if (*win == TRUE) prepare_next_round(netStruct, blockStruct, &v_res, n_miners);
+        i++;
+        flag = TRUE;
     }
 
+    down_timed(&(netStruct->sem_round));
+
+    free(workers);
     free(w_args);
 
     return EXIT_SUCCESS;
 }
 
-int prepare_next_round(NetData *netStruct, Block *blockStruct) {
-    int i, n_miners;
+int prepare_next_round(NetData *netStruct, Block *blockStruct, int *v_res, int n_miners) {
+    int i;
 
-    sem_wait(&(netStruct->sem_net_mutex));
-    n_miners = netStruct->total_miners;
-    sem_post(&(netStruct->sem_net_mutex));
+    down(&(netStruct->sem_block_mutex));
+    down(&(netStruct->sem_net_mutex));
 
-    /* Wait for all miners (except winner) to update their blockchains */
-    for (i=0; i<n_miners-1; i++) {
-        sem_wait(&(netStruct->sem_updated));
+    if (*v_res == TRUE) {
+        blockStruct->id++ ;
+        blockStruct->target = blockStruct->solution;
+        blockStruct->solution = -1;
+        blockStruct->is_valid = FALSE;
+        netStruct->last_winner = getpid();
     }
+    else {
+        blockStruct->solution = -1;
+    }
+    netStruct->current_winner = -1;
+    for (i=0; i<MAX_MINERS; i++) netStruct->voting_pool[i] = -1;
 
-    sem_wait(&(netStruct->sem_block_mutex));
-
-    blockStruct->id++ ;
-    blockStruct->target = blockStruct->solution;
-    blockStruct->solution = -1;
-    blockStruct->is_valid = FALSE;
-
+    sem_post(&(netStruct->sem_net_mutex));
     sem_post(&(netStruct->sem_block_mutex));
 
-    for (i=0; i<n_miners; i++) {
-        sem_post(&(netStruct->sem_round));
-    }
+
+    for (i=0; i<n_miners; i++) sem_post(&(netStruct->sem_round));
 
     /* Now other miners can join the net */
     sem_post(&(netStruct->sem_entry));
 
+    *v_res = -1;
+
     return EXIT_SUCCESS;
 }
 
-int update_blockchain(Block **pplast_block, Block *shm_block) {
+int update_blockchain(NetData *netStruct, Block *shm_block, Block **pplast_block) {
     Block *temp;
 
+    down(&(netStruct->sem_block_mutex));
+
     temp = (Block*) malloc(sizeof(Block));
-    if (memcpy(temp, shm_block, sizeof(Block)) == NULL) return EXIT_FAILURE;
+    if (temp == NULL) return EXIT_FAILURE;
+    if (memcpy(temp, shm_block, sizeof(Block)) == NULL) {
+        free(temp);
+        return EXIT_FAILURE;
+    }
 
     temp->prev = *pplast_block;
     if (*pplast_block != NULL) (*pplast_block)->next = temp;
 
     *pplast_block = temp;
+
+    sem_post(&(netStruct->sem_block_mutex));
 
     return EXIT_SUCCESS;
 }
@@ -571,13 +724,13 @@ void print_blocks(Block *plast_block) {
 
 int clean(NetData *netStruct, Block *blockStruct, Block *plast_block, int miner_ind, int *win) {
 
-    sem_wait(&(netStruct->sem_block_mutex));
+    down(&(netStruct->sem_block_mutex));
 
     blockStruct->wallets[miner_ind] = -1;
 
     sem_post(&(netStruct->sem_block_mutex));
 
-    sem_wait(&(netStruct->sem_net_mutex));
+    down(&(netStruct->sem_net_mutex));
 
     /* Tell other miners this miner is finished */
     netStruct->miners_pid[miner_ind] = -1;
@@ -594,6 +747,8 @@ int clean(NetData *netStruct, Block *blockStruct, Block *plast_block, int miner_
         sem_destroy(&netStruct->sem_winner);
         sem_destroy(&netStruct->sem_updated);
         sem_destroy(&netStruct->sem_entry);
+        sem_destroy(&netStruct->sem_voting);
+        sem_destroy(&netStruct->sem_result);
         shm_unlink(SHM_NAME_NET);
         shm_unlink(SHM_NAME_BLOCK);
     } else {
@@ -606,6 +761,7 @@ int clean(NetData *netStruct, Block *blockStruct, Block *plast_block, int miner_
     munmap(netStruct, sizeof(NetData));
     munmap(blockStruct, sizeof(Block));
 
+    /* Free miner's blockchain */
     for (Block *block = plast_block, *temp = NULL; block != NULL && temp != NULL; block = temp) {
         temp = block->prev;
         free(block);
